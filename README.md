@@ -280,10 +280,6 @@ Jika tugas >5, gunakan tombol:
 
 ---
 
-## 📚 Documentation
-
-Untuk dokumentasi lengkap, lihat file berikut:
-
 - **`UPDATE_SUMMARY.md`** - Technical summary & implementation details
 - **`QUICK_START.md`** - Panduan lengkap untuk end-users
 - **`TESTING_CHECKLIST.md`** - Testing checklist untuk developers
