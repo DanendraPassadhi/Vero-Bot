@@ -7,11 +7,14 @@ Bot Discord untuk manajemen to-do list dengan reminder otomatis, pagination inte
 ### 📝 Basic Features
 
 - ✅ **Tambah tugas** dengan `/add` (judul, deadline, deskripsi, tag: individu/kelompok)
-- ✅ **Tampilkan tugas** dengan `/list` (pagination otomatis jika >5 tugas)
+- ✅ **Tampilkan tugas** dengan `/list` (pagination otomatis jika >5 tugas, dengan jam spesifik)
 - ✅ **Edit tugas** dengan `/edit` (ubah judul, deadline, deskripsi, atau tag)
 - ✅ **Tandai selesai** dengan `/done` (ID atau nomor dari `/list`)
+- ✅ **Tambah event** dengan `/addevent` (rapat, meeting, dll dengan waktu mulai & selesai)
+- ✅ **Tampilkan event** dengan `/listevent` (pemisahan event dan task, dengan jam spesifik)
+- ✅ **Tandai event selesai** dengan `/doneevent` (ID atau nomor dari `/listevent`)
 - ✅ **Set timezone** per user dengan `/settimezone` (default: Asia/Jakarta)
-- ✅ **Set channel** reminder dengan `/setchannel` (Admin only)
+- ✅ **Set channel** reminder dengan `/setchannel` (Admin only, pisah channel untuk task & event)
 
 ### 🚀 Advanced Features (v2.0)
 
@@ -38,6 +41,26 @@ Bot Discord untuk manajemen to-do list dengan reminder otomatis, pagination inte
 - **APScheduler** - Background scheduler untuk reminders
 - **zoneinfo** - Timezone support (IANA)
 - **Python 3.11+** - Async/await, modern Python features
+
+## 📂 Project Structure (Modular)
+
+```
+Vero-Bot/
+├── bot.py              # Main bot file (commands, event handlers, reminders)
+├── config.py           # Configuration & constants
+├── database.py         # MongoDB collection definitions
+├── utils.py            # Helper functions (date formatting, timezone handling)
+├── views.py            # Discord UI components (pagination views)
+├── requirements.txt    # Python dependencies
+├── .env.example        # Environment variables template
+└── README.md           # This file
+```
+
+**Fitur Modular:**
+
+- Separated tasks & events management
+- Clean date formatting (Indonesian: "Senin 30 Desember 2025")
+- Time display with HH:MM format (e.g., "10:30 - 12:00")
 
 ---
 
@@ -104,19 +127,22 @@ Bot akan:
 
 ## 🎮 Command List
 
-| Command         | Description                           | Example                                                               |
-| --------------- | ------------------------------------- | --------------------------------------------------------------------- |
-| `/add`          | Tambah tugas baru                     | `/add judul:"Tugas" tanggal_deadline:"2025-12-25 10:00" tag:kelompok` |
-| `/list`         | Tampilkan tugas (dengan pagination)   | `/list`                                                               |
-| `/edit`         | Edit tugas existing                   | `/edit identifier:1`                                                  |
-| `/done`         | Tandai tugas selesai                  | `/done identifier:1`                                                  |
-| `/assign`       | Assign tugas ke users (kelompok only) | `/assign identifier:1 users:@User1 @User2`                            |
-| `/listkelompok` | Lihat semua tugas kelompok di server  | `/listkelompok`                                                       |
-| `/setreminder`  | Set custom reminder                   | `/setreminder identifier:1 waktu:1d`                                  |
-| `/settimezone`  | Set timezone personal                 | `/settimezone tz:Asia/Jakarta`                                        |
-| `/setchannel`   | Set channel untuk reminders (Admin)   | `/setchannel`                                                         |
-| `/ping`         | Check bot status & latency            | `/ping`                                                               |
-| `/help`         | Tampilkan panduan lengkap             | `/help`                                                               |
+| Command         | Description                           | Example                                                                                         |
+| --------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------- |
+| `/add`          | Tambah tugas baru                     | `/add judul:"Tugas" tanggal_deadline:"2025-12-25 10:00" tag:kelompok`                           |
+| `/list`         | Tampilkan tugas (dengan pagination)   | `/list`                                                                                         |
+| `/edit`         | Edit tugas existing                   | `/edit identifier:1`                                                                            |
+| `/done`         | Tandai tugas selesai                  | `/done identifier:1`                                                                            |
+| `/addevent`     | Tambah event baru (acara/meeting)     | `/addevent judul:"Meeting" tanggal_mulai:"2025-12-25 10:00" tanggal_selesai:"2025-12-25 12:00"` |
+| `/listevent`    | Tampilkan event (dengan pagination)   | `/listevent`                                                                                    |
+| `/doneevent`    | Tandai event selesai                  | `/doneevent identifier:1`                                                                       |
+| `/assign`       | Assign tugas ke users (kelompok only) | `/assign identifier:1 users:@User1 @User2`                                                      |
+| `/listkelompok` | Lihat semua tugas kelompok di server  | `/listkelompok`                                                                                 |
+| `/setreminder`  | Set custom reminder                   | `/setreminder identifier:1 waktu:1d`                                                            |
+| `/settimezone`  | Set timezone personal                 | `/settimezone tz:Asia/Jakarta`                                                                  |
+| `/setchannel`   | Set channel untuk reminders (Admin)   | `/setchannel channel:#reminders tag:task`                                                       |
+| `/ping`         | Check bot status & latency            | `/ping`                                                                                         |
+| `/help`         | Tampilkan panduan lengkap             | `/help`                                                                                         |
 
 ---
 
@@ -245,7 +271,8 @@ Jika tugas >5, gunakan tombol:
 ```javascript
 {
     "guild_id": int,
-    "channel_id": int         // Channel for reminders
+    "channel_id_task": int,   // Channel for task reminders
+    "channel_id_event": int   // Channel for event reminders
 }
 ```
 
@@ -374,6 +401,16 @@ Need help? Check:
 
 ## 🎉 Changelog
 
+### v2.1 (2025-12-31) - Events & Modular Update
+
+- ✅ **Separated Tasks & Events** - Distinct commands for tasks vs events
+- ✅ **Event Management** - `/addevent`, `/listevent`, `/doneevent` commands
+- ✅ **Time Display** - Show specific HH:MM times in list & listevent
+- ✅ **Code Modularization** - Split into config.py, database.py, utils.py, views.py
+- ✅ **Separate Reminder Channels** - Different channels for task & event reminders
+- ✅ **Backward Compatibility** - Handle old/new event field names gracefully
+- ✅ **Bug Fixes** - Fixed /listevent KeyError when accessing old field names
+
 ### v2.0 (2025-11-18)
 
 - ✅ Added interactive pagination with buttons
@@ -394,6 +431,6 @@ Need help? Check:
 
 ---
 
-**Bot Version:** v2.0  
-**Last Updated:** 2025-11-18  
+**Bot Version:** v2.1  
+**Last Updated:** 2025-12-31  
 **Status:** ✅ Production Ready

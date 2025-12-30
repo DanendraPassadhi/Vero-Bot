@@ -8,22 +8,22 @@ from pymongo.errors import ServerSelectionTimeoutError
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from pymongo import MongoClient
 from bson.objectid import ObjectId
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
-from dotenv import load_dotenv
 
-load_dotenv()
+# Import from local modules
+from config import TOKEN, MONGO_URI, DEFAULT_TZ, REMINDER_THRESHOLDS, DEV_GUILDS
+from database import tasks_col, events_col, users_col, guilds_col
+from utils import (
+    parse_deadline, ensure_aware_utc, ensure_aware_tz,
+    human_delta, format_date, get_user_timezone
+)
+from views import TaskListView, EventListView
 
 LOG = logging.getLogger('todo-bot')
 logging.basicConfig(level=logging.INFO)
-
-TOKEN = os.getenv('DISCORD_TOKEN')
-MONGO_URI = os.getenv('MONGO_URI')
-DB_NAME = os.getenv('MONGO_DB', 'todo_bot')
-DEFAULT_TZ = os.getenv('DEFAULT_TZ', 'Asia/Jakarta')
 
 if not TOKEN or not MONGO_URI:
     LOG.error('Missing DISCORD_TOKEN or MONGO_URI in environment')
@@ -33,98 +33,17 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
-# Mongo
-client = MongoClient(MONGO_URI)
-db = client[DB_NAME]
-tasks_col = db['tasks']
-users_col = db['user_settings']
-guilds_col = db['guild_settings']
-
 # Scheduler
 scheduler = AsyncIOScheduler()
-
-# Reminder thresholds in hours
-REMINDER_THRESHOLDS = [72, 24, 5]
-
-
-def parse_deadline(date_str: str, tz_str: str) -> datetime:
-    """Parse a datetime string 'YYYY-MM-DD HH:MM' in user's timezone and return a datetime
-    normalized to the default timezone (DEFAULT_TZ, Asia/Jakarta by default)."""
-    try:
-        dt = datetime.strptime(date_str, '%Y-%m-%d %H:%M')
-    except ValueError:
-        raise ValueError("Format harus: YYYY-MM-DD HH:MM")
-
-    try:
-        tz = ZoneInfo(tz_str)
-    except Exception:
-        raise ValueError(f"Timezone tidak dikenali: {tz_str}")
-
-    local_dt = dt.replace(tzinfo=tz)
-    # Convert to UTC for storage (PyMongo stores times in UTC). We'll display
-    # and compute reminders relative to DEFAULT_TZ, but store as UTC to avoid
-    # ambiguity with MongoDB behavior.
-    utc_dt = local_dt.astimezone(ZoneInfo('UTC'))
-    return utc_dt
-
-
-def ensure_aware_utc(dt: datetime) -> datetime:
-    """Ensure a datetime is timezone-aware in UTC.
-
-    PyMongo returns naive datetimes (no tzinfo). Treat naive datetimes as UTC and
-    return an aware datetime in UTC so arithmetic with aware datetimes works.
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=ZoneInfo('UTC'))
-    return dt.astimezone(ZoneInfo('UTC'))
-
-
-def human_delta(delta: timedelta) -> str:
-    total_seconds = int(delta.total_seconds())
-    if total_seconds < 0:
-        return 'sudah lewat'
-    days, rem = divmod(total_seconds, 86400)
-    hours, rem = divmod(rem, 3600)
-    minutes, _ = divmod(rem, 60)
-    parts = []
-    if days:
-        parts.append(f"{days}d")
-    if hours:
-        parts.append(f"{hours}h")
-    parts.append(f"{minutes}m")
-    return ' '.join(parts)
-
-
-async def get_user_timezone(user_id: int) -> str:
-    doc = users_col.find_one({'user_id': user_id})
-    return doc.get('timezone', DEFAULT_TZ) if doc else DEFAULT_TZ
-
-
-def ensure_aware_tz(dt: datetime) -> datetime:
-    """Ensure a datetime is timezone-aware in the default timezone.
-
-    PyMongo returns naive datetimes (no tzinfo). Treat naive datetimes as in
-    the default timezone (Asia/Jakarta by default) and return an aware datetime
-    in that timezone so arithmetic with aware datetimes works.
-    """
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return dt.replace(tzinfo=ZoneInfo(DEFAULT_TZ))
-    return dt.astimezone(ZoneInfo(DEFAULT_TZ))
 
 
 @bot.event
 async def on_ready():
     LOG.info(f'Logged in as {bot.user} (ID: {bot.user.id})')
     # Sync application commands (slash commands).
-    # If you want fast registration for testing, set DEV_GUILDS env to a comma-separated list of guild IDs.
     try:
-        dev_guilds = os.getenv('DEV_GUILDS')
-        if dev_guilds:
-            gids = [g.strip() for g in dev_guilds.split(',') if g.strip()]
+        if DEV_GUILDS:
+            gids = [g.strip() for g in DEV_GUILDS.split(',') if g.strip()]
             for gid in gids:
                 try:
                     obj = discord.Object(id=int(gid))
@@ -175,23 +94,40 @@ async def settimezone(interaction: discord.Interaction, tz: str):
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-@tree.command(name='setchannel', description='Atur channel untuk reminder di server ini (butuh izin Manage Server)')
+@tree.command(name='setchannel', description='Atur channel untuk reminder (butuh izin Manage Server)')
 @app_commands.guild_only()
 @app_commands.checks.has_permissions(manage_guild=True)
-@app_commands.describe(channel='Channel teks untuk mengirim reminder')
-async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel):
+@app_commands.describe(
+    channel='Channel teks untuk mengirim reminder',
+    tag='Tipe item: task (tugas) atau event (acara)'
+)
+@app_commands.choices(tag=[
+    app_commands.Choice(name='📋 Task (Tugas)', value='task'),
+    app_commands.Choice(name='📅 Event (Acara)', value='event')
+])
+async def setchannel(interaction: discord.Interaction, channel: discord.TextChannel, tag: str = 'task'):
     await interaction.response.defer(ephemeral=True)
     guild_id = interaction.guild.id if interaction.guild else None
     if not guild_id:
         await interaction.followup.send('Perintah ini hanya bisa dipakai di dalam server.', ephemeral=True)
         return
-    # store channel id in a simple guild_settings collection
-    db['guild_settings'].update_one({'guild_id': guild_id}, {'$set': {'channel_id': channel.id}}, upsert=True)
+    
+    # Store channel id with type tag in guild_settings
+    db['guild_settings'].update_one(
+        {'guild_id': guild_id}, 
+        {'$set': {f'channel_id_{tag}': channel.id}}, 
+        upsert=True
+    )
+    
+    tag_display = '📋 Task (Tugas)' if tag == 'task' else '📅 Event (Acara)'
+    
     embed = discord.Embed(
         title='📢 Channel Reminder Diatur',
-        description=f'Semua reminder untuk server ini akan dikirim ke {channel.mention}',
+        description=f'Channel untuk reminder **{tag_display}** berhasil diatur',
         color=discord.Color.green()
     )
+    embed.add_field(name='🏷️ Tipe', value=tag_display, inline=True)
+    embed.add_field(name='📍 Channel', value=channel.mention, inline=True)
     embed.set_thumbnail(url=interaction.guild.icon.url if interaction.guild.icon else None)
     embed.set_footer(text=f'Diatur oleh {interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
     embed.timestamp = datetime.now(ZoneInfo('UTC'))
@@ -239,6 +175,11 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False
     )
     embed.add_field(
+        name='📅 /addevent',
+        value='Tambah event baru (rapat, meeting, dll)\n`judul` `tanggal_mulai` `tanggal_selesai` `deskripsi`\nFormat: YYYY-MM-DD HH:MM',
+        inline=False
+    )
+    embed.add_field(
         name='📝 /list',
         value='Tampilkan semua tugas yang belum selesai\nUrut berdasarkan deadline terdekat',
         inline=False
@@ -251,6 +192,11 @@ async def help_cmd(interaction: discord.Interaction):
     embed.add_field(
         name='✔️ /done',
         value='Tandai tugas selesai\nGunakan ID (8 karakter) atau nomor dari /list',
+        inline=False
+    )
+    embed.add_field(
+        name='✅ /doneevent',
+        value='Tandai event selesai\nGunakan ID (8 karakter) atau nomor dari /list',
         inline=False
     )
     embed.add_field(
@@ -343,121 +289,79 @@ async def add(interaction: discord.Interaction, judul: str, tanggal_deadline: st
     )
     embed.add_field(name='🆔 ID', value=f'`{short_id}`', inline=True)
     embed.add_field(name='🏷️ Tag', value=tag_display, inline=True)
-    embed.add_field(name='📅 Deadline', value=dl_local.strftime('%Y-%m-%d %H:%M %Z'), inline=False)
+    embed.add_field(name='📅 Deadline', value=format_date(dl_local), inline=False)
     embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
     embed.add_field(name='👤 Dibuat Oleh', value=f'<@{interaction.user.id}>', inline=True)
     embed.timestamp = now_utc
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-# Pagination View untuk /list
-class TaskListView(discord.ui.View):
-    def __init__(self, tasks, user_id, tz, guild_id):
-        super().__init__(timeout=300)  # 5 minutes timeout
-        self.tasks = tasks
-        self.user_id = user_id
-        self.tz = tz
-        self.guild_id = guild_id
-        self.current_page = 0
-        self.items_per_page = 5
-        self.total_pages = (len(tasks) - 1) // self.items_per_page + 1
-        
-        # Update button states
-        self.update_buttons()
+@tree.command(name='addevent', description='Tambah event baru (rapat, meeting, dll)')
+@app_commands.describe(
+    judul='Judul event',
+    tanggal_mulai='Format: YYYY-MM-DD HH:MM',
+    tanggal_selesai='Format: YYYY-MM-DD HH:MM',
+    deskripsi='Deskripsi (opsional)'
+)
+async def addevent(interaction: discord.Interaction, judul: str, tanggal_mulai: str, tanggal_selesai: str, deskripsi: str = None):
+    await interaction.response.defer()
+    tz = await get_user_timezone(interaction.user.id)
+    try:
+        event_utc = parse_deadline(tanggal_mulai, tz)
+    except ValueError as e:
+        await interaction.followup.send(f'Error: {e}', ephemeral=True)
+        return
+
+    now_utc = datetime.now(ZoneInfo('UTC'))
+    if event_utc <= now_utc:
+        await interaction.followup.send('Tanggal event tidak boleh di masa lalu.', ephemeral=True)
+        return
+
+    # Parse end time (required)
+    try:
+        end_utc = parse_deadline(tanggal_selesai, tz)
+    except ValueError as e:
+        await interaction.followup.send(f'Error tanggal selesai: {e}', ephemeral=True)
+        return
     
-    def update_buttons(self):
-        self.previous_button.disabled = self.current_page == 0
-        self.next_button.disabled = self.current_page >= self.total_pages - 1
+    if end_utc <= event_utc:
+        await interaction.followup.send('Tanggal selesai harus setelah tanggal mulai.', ephemeral=True)
+        return
+
+    doc = {
+        'user_id': interaction.user.id,
+        'guild_id': interaction.guild.id if interaction.guild else None,
+        'judul': judul,
+        'deskripsi': deskripsi,
+        'tanggal_mulai': event_utc,
+        'status': False,
+        'created_at': now_utc,
+        'reminders_sent': [],
+        'custom_reminders': [],
+        'tanggal_selesai': end_utc
+    }
+    res = events_col.insert_one(doc)
+    short_id = str(res.inserted_id)[:8]
+    event_local = event_utc.astimezone(ZoneInfo(tz))
     
-    def get_embed(self):
-        now_utc = datetime.now(ZoneInfo('UTC'))
-        start_idx = self.current_page * self.items_per_page
-        end_idx = min(start_idx + self.items_per_page, len(self.tasks))
-        page_tasks = self.tasks[start_idx:end_idx]
-        
-        embed = discord.Embed(
-            title='📝 Daftar Tugas Aktif',
-            description=f'Total: **{len(self.tasks)}** tugas aktif',
-            color=discord.Color.blue()
-        )
-        embed.set_thumbnail(url='https://i.pinimg.com/736x/87/8b/74/878b7473dc8d68673b9ae5f3ca4103ba.jpg')
-        
-        for idx, t in enumerate(page_tasks, start=start_idx + 1):
-            deadline_utc = ensure_aware_utc(t['deadline'])
-            dl_local = deadline_utc.astimezone(ZoneInfo(self.tz))
-            delta = deadline_utc - now_utc
-            countdown = human_delta(delta)
-            short_id = str(t['_id'])[:8]
-            desc = t.get('deskripsi') or '_Tidak ada deskripsi_'
-            
-            # Emoji based on urgency
-            hours_left = delta.total_seconds() / 3600
-            if hours_left < 24:
-                emoji = '🔴'
-            elif hours_left < 72:
-                emoji = '🟡'
-            else:
-                emoji = '🟢'
-            
-            # Tag emoji
-            task_tag = t.get('tag', 'individu')
-            tag_emoji = '👤' if task_tag == 'individu' else '👥'
-            
-            # Assigned users
-            assigned = t.get('assigned_users', [])
-            assigned_text = ''
-            if assigned:
-                assigned_mentions = ' '.join([f'<@{uid}>' for uid in assigned[:3]])
-                if len(assigned) > 3:
-                    assigned_mentions += f' +{len(assigned) - 3}'
-                assigned_text = f'\n👥 **Assigned:** {assigned_mentions}'
-            
-            field_name = f'{emoji} {idx}. {t["judul"]} {tag_emoji}'
-            field_value = (
-                f'{desc}'
-                f'{assigned_text}\n'
-                f'📅 **Deadline:** {dl_local.strftime("%Y-%m-%d %H:%M %Z")}\n'
-                f'⏰ **Tersisa:** {countdown}\n'
-                f'🆔 `{short_id}`'
-            )
-            embed.add_field(name=field_name, value=field_value, inline=False)
-        
-        embed.set_footer(text=f'Halaman {self.current_page + 1}/{self.total_pages}')
-        embed.timestamp = now_utc
-        return embed
+    # Format end time (always available now)
+    end_local = end_utc.astimezone(ZoneInfo(tz))
+    end_time_text = f' - {end_local.strftime("%H:%M")}'
     
-    @discord.ui.button(label='◀️ Prev', style=discord.ButtonStyle.gray, custom_id='prev')
-    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message('❌ Ini bukan list tugas kamu!', ephemeral=True)
-            return
-        self.current_page -= 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-    
-    @discord.ui.button(label='Next ▶️', style=discord.ButtonStyle.gray, custom_id='next')
-    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message('❌ Ini bukan list tugas kamu!', ephemeral=True)
-            return
-        self.current_page += 1
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
-    
-    @discord.ui.button(label='🔄 Refresh', style=discord.ButtonStyle.green, custom_id='refresh')
-    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.user_id:
-            await interaction.response.send_message('❌ Ini bukan list tugas kamu!', ephemeral=True)
-            return
-        # Re-fetch tasks
-        cursor = tasks_col.find({'user_id': self.user_id, 'guild_id': self.guild_id, 'status': False}).sort('deadline', 1)
-        rows = list(cursor)
-        now_utc = datetime.now(ZoneInfo('UTC'))
-        self.tasks = [t for t in rows if ensure_aware_utc(t['deadline']) > now_utc]
-        self.total_pages = (len(self.tasks) - 1) // self.items_per_page + 1 if self.tasks else 1
-        self.current_page = min(self.current_page, self.total_pages - 1)
-        self.update_buttons()
-        await interaction.response.edit_message(embed=self.get_embed(), view=self)
+    embed = discord.Embed(
+        title=f'✅ Event Berhasil Ditambahkan',
+        description=f'**{judul}**\n\n{deskripsi or "_Tidak ada deskripsi_"}',
+        color=discord.Color.orange()
+    )
+    embed.add_field(name='🆔 ID', value=f'`{short_id}`', inline=True)
+    embed.add_field(name='📅 Waktu', value=f'{format_date(event_local)} {event_local.strftime("%H:%M")}{end_time_text}', inline=False)
+    embed.add_field(name='👤 Dibuat Oleh', value=f'<@{interaction.user.id}>', inline=True)
+    embed.timestamp = now_utc
+    await interaction.followup.send(embed=embed)
+
+
+# Pagination View para /list
+# (Moved to views.py - imported above)
 
 
 @tree.command(name='list', description='Tampilkan list tugas belum selesai')
@@ -465,44 +369,42 @@ async def list_tasks(interaction: discord.Interaction):
     await interaction.response.defer()
     user_id = interaction.user.id
     guild_id = interaction.guild.id if interaction.guild else None
-    cursor = tasks_col.find({'user_id': user_id, 'guild_id': guild_id, 'status': False}).sort('deadline', 1)
-    rows = list(cursor)
     
-    # Filter out overdue tasks (deadline has passed)
+    # Fetch tasks
+    task_cursor = tasks_col.find({'user_id': user_id, 'guild_id': guild_id, 'status': False}).sort('deadline', 1)
+    task_rows = list(task_cursor)
+    
+    # Filter out overdue items
     now_utc = datetime.now(ZoneInfo('UTC'))
-    active_rows = []
-    for t in rows:
-        deadline_utc = ensure_aware_utc(t['deadline'])
-        if deadline_utc > now_utc:  # Only include tasks with future deadlines
-            active_rows.append(t)
+    active_tasks = [t for t in task_rows if ensure_aware_utc(t['deadline']) > now_utc]
     
-    if not active_rows:
+    tz = await get_user_timezone(user_id)
+    
+    if not active_tasks:
         embed = discord.Embed(
             title='📝 Daftar Tugas',
-            description='✨ Tidak ada tugas aktif! Gunakan `/add` untuk membuat tugas baru.',
+            description='✨ Tidak ada tugas aktif!\nGunakan `/add` untuk membuat tugas.',
             color=discord.Color.light_grey()
         )
         embed.set_footer(text=f'{interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
         await interaction.followup.send(embed=embed, ephemeral=True)
         return
-
-    tz = await get_user_timezone(user_id)
     
     # Use pagination if more than 5 tasks
-    if len(active_rows) > 5:
-        view = TaskListView(active_rows, user_id, tz, guild_id)
+    if len(active_tasks) > 5:
+        view = TaskListView(active_tasks, user_id, tz, guild_id)
         await interaction.followup.send(embed=view.get_embed(), view=view)
         return
     
     # Simple embed for <=5 tasks
     embed = discord.Embed(
-        title='📝 Daftar Tugas Aktif',
-        description=f'Total: **{len(active_rows)}** tugas aktif',
+        title='📋 Daftar Tugas',
+        description=f'Total: **{len(active_tasks)}** tugas aktif',
         color=discord.Color.blue()
     )
     embed.set_thumbnail(url='https://i.pinimg.com/736x/87/8b/74/878b7473dc8d68673b9ae5f3ca4103ba.jpg')
     
-    for idx, t in enumerate(active_rows, start=1):
+    for idx, t in enumerate(active_tasks, start=1):
         deadline_utc = ensure_aware_utc(t['deadline'])
         dl_local = deadline_utc.astimezone(ZoneInfo(tz))
         delta = deadline_utc - now_utc
@@ -510,20 +412,17 @@ async def list_tasks(interaction: discord.Interaction):
         short_id = str(t['_id'])[:8]
         desc = t.get('deskripsi') or '_Tidak ada deskripsi_'
         
-        # Emoji based on urgency (only for active tasks now)
         hours_left = delta.total_seconds() / 3600
         if hours_left < 24:
-            emoji = '🔴'  # urgent
+            emoji = '🔴'
         elif hours_left < 72:
-            emoji = '🟡'  # soon
+            emoji = '🟡'
         else:
-            emoji = '🟢'  # plenty of time
+            emoji = '🟢'
         
-        # Tag emoji
         task_tag = t.get('tag', 'individu')
         tag_emoji = '👤' if task_tag == 'individu' else '👥'
         
-        # Assigned users
         assigned = t.get('assigned_users', [])
         assigned_text = ''
         if assigned:
@@ -536,11 +435,89 @@ async def list_tasks(interaction: discord.Interaction):
         field_value = (
             f'{desc}'
             f'{assigned_text}\n'
-            f'📅 **Deadline:** {dl_local.strftime("%Y-%m-%d %H:%M %Z")}\n'
+            f'📅 **Deadline:** {format_date(dl_local)}\n'
             f'⏰ **Tersisa:** {countdown}\n'
             f'🆔 `{short_id}`'
         )
         embed.add_field(name=field_name, value=field_value, inline=False)
+
+    embed.set_footer(text=f'Requested by {interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
+    embed.timestamp = now_utc
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name='listevent', description='Tampilkan list event belum selesai')
+async def list_events(interaction: discord.Interaction):
+    await interaction.response.defer()
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id if interaction.guild else None
+    
+    # Fetch events
+    event_cursor = events_col.find({'user_id': user_id, 'guild_id': guild_id, 'status': False}).sort('tanggal_mulai', 1)
+    event_rows = list(event_cursor)
+    
+    # Filter out overdue items
+    now_utc = datetime.now(ZoneInfo('UTC'))
+    active_events = []
+    for e in event_rows:
+        # Handle both old 'tanggal' and new 'tanggal_mulai' field names
+        event_time = e.get('tanggal_mulai') or e.get('tanggal')
+        if event_time and ensure_aware_utc(event_time) > now_utc:
+            active_events.append(e)
+    
+    tz = await get_user_timezone(user_id)
+    
+    if not active_events:
+        embed = discord.Embed(
+            title='📅 Daftar Event',
+            description='✨ Tidak ada event aktif!\nGunakan `/addevent` untuk membuat event.',
+            color=discord.Color.light_grey()
+        )
+        embed.set_footer(text=f'{interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+    
+    # Use pagination if more than 5 events
+    if len(active_events) > 5:
+        view = EventListView(active_events, user_id, tz, guild_id)
+        await interaction.followup.send(embed=view.get_embed(), view=view)
+        return
+    
+    # Simple embed for <=5 events
+    embed = discord.Embed(
+        title='📅 Daftar Event',
+        description=f'Total: **{len(active_events)}** event aktif',
+        color=discord.Color.orange()
+    )
+    embed.set_thumbnail(url='https://i.pinimg.com/736x/9d/9f/e0/9d9fe08a397670cf7aa24facaddcceee.jpg')
+    
+    for idx, e in enumerate(active_events, start=1):
+        # Handle both old 'tanggal' and new 'tanggal_mulai' field names
+        event_time = e.get('tanggal_mulai') or e.get('tanggal')
+        event_utc = ensure_aware_utc(event_time)
+        ev_local = event_utc.astimezone(ZoneInfo(tz))
+        short_id = str(e['_id'])[:8]
+        desc = e.get('deskripsi') or '_Tidak ada deskripsi_'
+        
+        # Build event time info
+        time_info = f'{ev_local.strftime("%H:%M")}'
+        # Add end time if available
+        if 'tanggal_selesai' in e and e['tanggal_selesai']:
+            end_utc = ensure_aware_utc(e['tanggal_selesai'])
+            end_local = end_utc.astimezone(ZoneInfo(tz))
+            time_info += f' - {end_local.strftime("%H:%M")}'
+        
+        field_name = f'{idx}. {e["judul"]}'
+        field_value = (
+            f'{desc}\n'
+            f'🆔 `{short_id}`'
+        )
+        embed.add_field(name=field_name, value=field_value, inline=False)
+        
+        # Add time as separate inline field
+        date_str = format_date(ev_local)
+        embed.add_field(name='📅 Tanggal', value=date_str, inline=True)
+        embed.add_field(name='⏰ Waktu', value=time_info, inline=True)
 
     embed.set_footer(text=f'Requested by {interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
     embed.timestamp = now_utc
@@ -650,7 +627,7 @@ async def edit(interaction: discord.Interaction, identifier: str, judul: str = N
             
             old_dl = ensure_aware_utc(target['deadline']).astimezone(ZoneInfo(tz))
             new_dl = new_deadline_utc.astimezone(ZoneInfo(tz))
-            changes.append(f"**Deadline:** `{old_dl.strftime('%Y-%m-%d %H:%M')}` → `{new_dl.strftime('%Y-%m-%d %H:%M')}`")
+            changes.append(f"**Deadline:** `{format_date(old_dl)} {old_dl.strftime('%H:%M')}` → `{format_date(new_dl)} {new_dl.strftime('%H:%M')}`")
         except ValueError as e:
             embed = discord.Embed(
                 title='❌ Format Deadline Salah',
@@ -697,7 +674,7 @@ async def edit(interaction: discord.Interaction, identifier: str, judul: str = N
     delta = ensure_aware_utc(update_doc.get('deadline', target['deadline'])) - now_utc
     countdown = human_delta(delta)
     
-    embed.add_field(name='📅 Deadline Sekarang', value=final_deadline.strftime('%Y-%m-%d %H:%M %Z'), inline=False)
+    embed.add_field(name='📅 Deadline Sekarang', value=f'{format_date(final_deadline)} ({final_deadline.strftime("%H:%M %Z")})', inline=False)
     embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
     embed.add_field(name='👤 Diedit Oleh', value=f'<@{user_id}>', inline=True)
     
@@ -806,7 +783,7 @@ async def done(interaction: discord.Interaction, identifier: str):
     
     embed.add_field(
         name='📅 Deadline',
-        value=f'{dl_local.strftime("%Y-%m-%d %H:%M %Z")}\n{time_status}',
+        value=f'{format_date(dl_local)} ({dl_local.strftime("%H:%M %Z")})\n{time_status}',
         inline=False
     )
     
@@ -829,6 +806,114 @@ async def done(interaction: discord.Interaction, identifier: str):
     )
     
     embed.set_footer(text=f'ID: {str(target["_id"])[:8]} • Keep up the good work!', icon_url=interaction.user.display_avatar.url)
+    embed.timestamp = now_utc
+    
+    await interaction.followup.send(embed=embed)
+
+
+@tree.command(name='doneevent', description='Tandai event selesai dengan ID atau nomor')
+@app_commands.describe(identifier='ObjectId (prefix 8 chars ok) atau nomor urut dari /list')
+async def doneevent(interaction: discord.Interaction, identifier: str):
+    await interaction.response.defer()
+    user_id = interaction.user.id
+    guild_id = interaction.guild.id if interaction.guild else None
+
+    # Try as number (index) - need to count position in combined list
+    target = None
+    if identifier.isdigit():
+        idx = int(identifier) - 1
+        
+        # Fetch tasks and events to find the position
+        task_cursor = events_col.find({'user_id': user_id, 'guild_id': guild_id, 'status': False}).sort('tanggal_mulai', 1)
+        event_rows = list(task_cursor)
+        
+        now_utc = datetime.now(ZoneInfo('UTC'))
+        active_rows = [e for e in event_rows if ensure_aware_utc(e['tanggal_mulai']) > now_utc]
+        
+        if 0 <= idx < len(active_rows):
+            target = active_rows[idx]
+    else:
+        # try match by prefix or full ObjectId
+        try:
+            candidate = events_col.find_one({'_id': ObjectId(identifier)})
+            if candidate and candidate['user_id'] == user_id and candidate.get('guild_id') == guild_id:
+                target = candidate
+        except Exception:
+            cursor = events_col.find({'user_id': user_id, 'guild_id': guild_id, 'status': False})
+            for r in cursor:
+                if str(r['_id']).startswith(identifier):
+                    target = r
+                    break
+
+    if not target:
+        embed = discord.Embed(
+            title='❌ Event Tidak Ditemukan',
+            description=f'Tidak dapat menemukan event dengan identifier: `{identifier}`\n\n💡 **Tips:**\n• Gunakan `/list` untuk melihat nomor atau ID event\n• ID harus minimal 8 karakter pertama\n• Pastikan event milik kamu dan belum selesai',
+            color=discord.Color.red()
+        )
+        embed.set_thumbnail(url='https://i.pinimg.com/736x/9c/6d/96/9c6d96bb7d1e10e4ce0de2914329be36.jpg')
+        embed.set_footer(text=f'Diminta oleh {interaction.user.display_name}', icon_url=interaction.user.display_avatar.url)
+        embed.timestamp = datetime.now(ZoneInfo('UTC'))
+        await interaction.followup.send(embed=embed, ephemeral=True)
+        return
+
+    # Mark as completed
+    now_utc = datetime.now(ZoneInfo('UTC'))
+    events_col.update_one({'_id': target['_id']}, {'$set': {'status': True, 'completed_at': now_utc}})
+    
+    # Get user timezone for display
+    tz = await get_user_timezone(user_id)
+    event_utc = ensure_aware_utc(target['tanggal_mulai'])
+    ev_local = event_utc.astimezone(ZoneInfo(tz))
+    created_utc = ensure_aware_utc(target.get('created_at', now_utc))
+    
+    # Calculate if event was completed on time or late
+    time_diff = (now_utc - event_utc).total_seconds()
+    if time_diff < 0:
+        status_emoji = '🎉'
+        status_text = '**Event Sudah diselesaikan!**'
+        status_color = discord.Color.dark_green()
+        time_status = f'Diselesaikan **{human_delta(timedelta(seconds=abs(time_diff)))}** sebelum waktu'
+    else:
+        status_emoji = '⏰'
+        status_text = '**Event Selesai Terlambat**'
+        status_color = discord.Color.orange()
+        time_status = f'Diselesaikan **{human_delta(timedelta(seconds=time_diff))}** setelah waktu'
+    
+    # Create completion embed
+    embed = discord.Embed(
+        title=f'{status_emoji} Event Diselesaikan!',
+        description=f'{status_text}\n\n**{target["judul"]}**\n_{target.get("deskripsi") or "Tidak ada deskripsi"}_',
+        color=status_color
+    )
+    
+    embed.set_thumbnail(url='https://i.pinimg.com/736x/6e/7c/2f/6e7c2f925eff6444fb4d8992f1330768.jpg')
+    
+    embed.add_field(
+        name='📅 Tanggal Event',
+        value=f'{format_date(ev_local)} ({ev_local.strftime("%H:%M %Z")})\n{time_status}',
+        inline=False
+    )
+    
+    embed.add_field(
+        name='⏱️ Durasi',
+        value=f'{human_delta(now_utc - created_utc)}',
+        inline=True
+    )
+    
+    embed.add_field(
+        name='✅ Diselesaikan',
+        value=f'<t:{int(now_utc.timestamp())}:R>',
+        inline=True
+    )
+    
+    embed.add_field(
+        name='👤 Oleh',
+        value=f'<@{user_id}>',
+        inline=True
+    )
+    
+    embed.set_footer(text=f'ID: {str(target["_id"])[:8]}', icon_url=interaction.user.display_avatar.url)
     embed.timestamp = now_utc
     
     await interaction.followup.send(embed=embed)
@@ -942,7 +1027,7 @@ async def listkelompok(interaction: discord.Interaction):
     embed = discord.Embed(
         title='👥 Daftar Tugas Kelompok',
         description=f'Total: **{len(active_rows)}** tugas kelompok aktif di server ini',
-        color=discord.Color.purple()
+        color=discord.Color.blurple()
     )
     
     for idx, t in enumerate(active_rows[:5], start=1):  # Limit to 5
@@ -973,7 +1058,7 @@ async def listkelompok(interaction: discord.Interaction):
         field_value = (
             f'👤 **Owner:** <@{t["user_id"]}>'
             f'{assigned_text}\n'
-            f'📅 **Deadline:** {dl_local.strftime("%Y-%m-%d %H:%M")}\n'
+            f'📅 **Deadline:** {format_date(dl_local)} ({dl_local.strftime("%H:%M")})\n'
             f'⏰ **Tersisa:** {countdown} • 🆔 `{short_id}`'
         )
         embed.add_field(name=field_name, value=field_value, inline=False)
@@ -1089,7 +1174,7 @@ async def setreminder(interaction: discord.Interaction, identifier: str, waktu: 
         description=f'**{target["judul"]}**',
         color=discord.Color.green()
     )
-    embed.add_field(name='🔔 Reminder Waktu', value=reminder_local.strftime('%Y-%m-%d %H:%M %Z'), inline=False)
+    embed.add_field(name='🔔 Reminder Waktu', value=f'{format_date(reminder_local)} ({reminder_local.strftime("%H:%M %Z")})', inline=False)
     embed.add_field(name='⏰ Dalam', value=human_delta(reminder_time - now_utc), inline=True)
     embed.add_field(name='🆔 ID', value=f'`{str(target["_id"])[:8]}`', inline=True)
     embed.timestamp = now_utc
@@ -1133,7 +1218,7 @@ async def send_reminder_for_task(tdoc, threshold_hours: int):
         description=f'**{title}**\n\n{tdoc.get("deskripsi") or "_Tidak ada deskripsi_"}',
         color=color
     )
-    embed.add_field(name='📅 Deadline', value=dl_local.strftime('%Y-%m-%d %H:%M %Z'), inline=False)
+    embed.add_field(name='📅 Deadline', value=f'{format_date(dl_local)} ({dl_local.strftime("%H:%M %Z")})', inline=False)
     embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
     embed.add_field(name='👤 Pembuat', value=f'<@{user_id}>', inline=True)
     embed.set_footer(text=f'ID: {str(tdoc["_id"])[:8]} • Gunakan /done untuk menyelesaikan')
@@ -1148,8 +1233,8 @@ async def send_reminder_for_task(tdoc, threshold_hours: int):
     loop = asyncio.get_running_loop()
     gs = await loop.run_in_executor(None, lambda: guilds_col.find_one({'guild_id': guild_id}))
     channel = None
-    if gs and gs.get('channel_id'):
-        channel = bot.get_channel(int(gs['channel_id']))
+    if gs and gs.get('channel_id_task'):
+        channel = bot.get_channel(int(gs['channel_id_task']))
 
     # fallback: guild.system_channel or first accessible text channel
     if channel is None:
@@ -1175,14 +1260,96 @@ async def send_reminder_for_task(tdoc, threshold_hours: int):
         LOG.exception('Failed to send reminder in channel %s for task %s', getattr(channel, 'id', None), tdoc['_id'])
 
 
+async def send_reminder_for_event(edoc, threshold_hours: int):
+    user_id = edoc['user_id']
+    guild_id = edoc.get('guild_id')
+    title = edoc.get('judul')
+    # Handle both old 'tanggal' and new 'tanggal_mulai' field names for backward compatibility
+    event_time = edoc.get('tanggal_mulai') or edoc.get('tanggal')
+    if not event_time:
+        LOG.error('Event document missing both tanggal_mulai and tanggal: %s', edoc.get('_id'))
+        return
+    event_utc = ensure_aware_utc(event_time)
+    # fetch user's timezone from DB in executor to avoid blocking
+    loop = asyncio.get_running_loop()
+    user_doc = await loop.run_in_executor(None, lambda: users_col.find_one({'user_id': user_id}))
+    tz = (user_doc or {}).get('timezone', DEFAULT_TZ)
+    ev_local = event_utc.astimezone(ZoneInfo(tz))
+    delta = event_utc - datetime.now(ZoneInfo('UTC'))
+    countdown = human_delta(delta)
+
+    # Emoji and color based on urgency
+    if threshold_hours == 0:
+        emoji = '🚨'
+        color = discord.Color.dark_red()
+        urgency = 'EVENT DIMULAI!'
+    elif threshold_hours <= 5:
+        emoji = '⚠️'
+        color = discord.Color.red()
+        urgency = f'Reminder {threshold_hours} Jam!'
+    elif threshold_hours <= 24:
+        emoji = '⏰'
+        color = discord.Color.orange()
+        urgency = f'Reminder {threshold_hours} Jam!'
+    else:
+        emoji = '📢'
+        color = discord.Color.gold()
+        urgency = f'Reminder {threshold_hours} Jam!'
+
+    embed = discord.Embed(
+        title=f'{emoji} {urgency}',
+        description=f'**{title}**\n\n{edoc.get("deskripsi") or "_Tidak ada deskripsi_"}',
+        color=color
+    )
+    embed.add_field(name='📅 Tanggal Event', value=f'{format_date(ev_local)} ({ev_local.strftime("%H:%M %Z")})', inline=False)
+    embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
+    embed.add_field(name='👤 Pembuat', value=f'<@{user_id}>', inline=True)
+    embed.set_footer(text=f'ID: {str(edoc["_id"])[:8]} • Gunakan /doneevent untuk menyelesaikan')
+    embed.timestamp = datetime.now(ZoneInfo('UTC'))
+
+    if not guild_id:
+        LOG.warning('Event %s has no guild_id, skipping reminder (no guild target).', edoc['_id'])
+        return
+
+    # Prefer configured channel in guild_settings
+    gs = await loop.run_in_executor(None, lambda: guilds_col.find_one({'guild_id': guild_id}))
+    channel = None
+    if gs and gs.get('channel_id_event'):
+        channel = bot.get_channel(int(gs['channel_id_event']))
+
+    # fallback: guild.system_channel or first accessible text channel
+    if channel is None:
+        g = bot.get_guild(guild_id)
+        if not g:
+            LOG.debug('Guild %s not in cache; skipping reminder for event %s', guild_id, edoc['_id'])
+            return
+        channel = g.system_channel
+        if channel is None:
+            for c in g.channels:
+                if isinstance(c, discord.TextChannel) and c.permissions_for(g.me).send_messages:
+                    channel = c
+                    break
+
+    if channel is None:
+        LOG.warning('No available channel to send reminder for guild %s (event %s)', guild_id, edoc['_id'])
+        return
+
+    try:
+        await channel.send(content=f'<@{user_id}>', embed=embed)
+    except Exception:
+        LOG.exception('Failed to send reminder in channel %s for event %s', getattr(channel, 'id', None), edoc['_id'])
+
+
 def mark_reminder_sent(task_id, label):
     # synchronous helper still available
     tasks_col.update_one({'_id': task_id}, {'$addToSet': {'reminders_sent': label}})
 
 
-async def mark_reminder_sent_async(task_id, label):
+async def mark_reminder_sent_async(task_id, label, collection=None):
+    if collection is None:
+        collection = tasks_col
     loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, lambda: tasks_col.update_one({'_id': task_id}, {'$addToSet': {'reminders_sent': label}}))
+    await loop.run_in_executor(None, lambda: collection.update_one({'_id': task_id}, {'$addToSet': {'reminders_sent': label}}))
 
 
 async def check_reminders():
@@ -1268,17 +1435,17 @@ async def check_reminders():
                             description=f'**{title}**\n\n{tdoc.get("deskripsi") or "_Tidak ada deskripsi_"}',
                             color=discord.Color.blue()
                         )
-                        embed.add_field(name='📅 Deadline', value=dl_local.strftime('%Y-%m-%d %H:%M %Z'), inline=False)
+                        embed.add_field(name='📅 Deadline', value=f'{format_date(dl_local)} ({dl_local.strftime("%H:%M %Z")})', inline=False)
                         embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
-                        embed.add_field(name='🔔 Reminder Diatur', value=reminder_local.strftime('%Y-%m-%d %H:%M'), inline=True)
+                        embed.add_field(name='🔔 Reminder Diatur', value=f'{format_date(reminder_local)} ({reminder_local.strftime("%H:%M")})', inline=True)
                         embed.set_footer(text=f'ID: {str(tdoc["_id"])[:8]} • Gunakan /done untuk menyelesaikan')
                         embed.timestamp = now_utc
                         
                         # Send to configured channel
                         gs = await loop.run_in_executor(None, lambda: guilds_col.find_one({'guild_id': guild_id}))
                         channel = None
-                        if gs and gs.get('channel_id'):
-                            channel = bot.get_channel(int(gs['channel_id']))
+                        if gs and gs.get('channel_id_task'):
+                            channel = bot.get_channel(int(gs['channel_id_task']))
                         
                         if channel is None:
                             g = bot.get_guild(guild_id)
@@ -1302,6 +1469,114 @@ async def check_reminders():
                         LOG.info('Sent custom reminder for task %s at %s', tdoc['_id'], reminder_time)
                     except Exception:
                         LOG.exception('Failed to send custom reminder for task %s', tdoc['_id'])
+    
+    # Check events as well
+    try:
+        event_rows = await loop.run_in_executor(None, lambda: list(events_col.find({'status': False})))
+    except ServerSelectionTimeoutError as e:
+        LOG.exception('MongoDB ServerSelectionTimeoutError in check_reminders for events: %s', e)
+        event_rows = []
+    
+    for edoc in event_rows:
+        # DB stores event dates in UTC; normalize to aware UTC and then convert to DEFAULT_TZ
+        # Handle both old 'tanggal' and new 'tanggal_mulai' field names for backward compatibility
+        event_time = edoc.get('tanggal_mulai') or edoc.get('tanggal')
+        if not event_time:
+            continue
+        event_utc = ensure_aware_utc(event_time)
+        event_date = event_utc.astimezone(ZoneInfo(DEFAULT_TZ))
+        seconds_left = (event_date - now).total_seconds()
+
+        # Pre-event reminders (72h, 24h, 5h)
+        for th in REMINDER_THRESHOLDS:
+            label = f'rem_{th}h'
+            if label in edoc.get('reminders_sent', []):
+                continue
+            target_seconds = th * 3600
+            if target_seconds - 90 <= seconds_left <= target_seconds + 90:
+                try:
+                    await send_reminder_for_event(edoc, th)
+                    await mark_reminder_sent_async(edoc['_id'], label, events_col)
+                    LOG.info('Sent %sh reminder for event %s', th, edoc['_id'])
+                except Exception:
+                    LOG.exception('Failed to send reminder for event %s', edoc['_id'])
+
+        # Due notification: send once when event time has passed or is now
+        if seconds_left <= 0 and 'rem_due' not in edoc.get('reminders_sent', []):
+            try:
+                await send_reminder_for_event(edoc, 0)
+                await mark_reminder_sent_async(edoc['_id'], 'rem_due', events_col)
+                LOG.info('Sent due reminder for event %s', edoc['_id'])
+            except Exception:
+                LOG.exception('Failed to send due reminder for event %s', edoc['_id'])
+        
+        # Auto-delete events that are overdue by more than 24 hours
+        if seconds_left < -86400:
+            try:
+                await loop.run_in_executor(None, lambda: events_col.delete_one({'_id': edoc['_id']}))
+                LOG.info('Auto-deleted overdue event %s (overdue by %.1f hours)', edoc['_id'], abs(seconds_left / 3600))
+            except Exception:
+                LOG.exception('Failed to auto-delete overdue event %s', edoc['_id'])
+        
+        # Custom reminders for events
+        custom_reminders = edoc.get('custom_reminders', [])
+        if custom_reminders:
+            now_utc = datetime.now(ZoneInfo('UTC'))
+            for idx, reminder in enumerate(custom_reminders):
+                if reminder.get('sent', False):
+                    continue
+                reminder_time = ensure_aware_utc(reminder['time'])
+                diff = (now_utc - reminder_time).total_seconds()
+                if -90 <= diff <= 90:
+                    try:
+                        user_id = edoc['user_id']
+                        guild_id = edoc.get('guild_id')
+                        title = edoc.get('judul')
+                        
+                        user_doc = await loop.run_in_executor(None, lambda: users_col.find_one({'user_id': user_id}))
+                        tz = (user_doc or {}).get('timezone', DEFAULT_TZ)
+                        reminder_local = reminder_time.astimezone(ZoneInfo(tz))
+                        ev_local = event_utc.astimezone(ZoneInfo(tz))
+                        delta = event_utc - now_utc
+                        countdown = human_delta(delta)
+                        
+                        embed = discord.Embed(
+                            title='🔔 Custom Reminder!',
+                            description=f'**{title}**\n\n{edoc.get("deskripsi") or "_Tidak ada deskripsi_"}',
+                            color=discord.Color.blue()
+                        )
+                        embed.add_field(name='📅 Tanggal Event', value=f'{format_date(ev_local)} ({ev_local.strftime("%H:%M %Z")})', inline=False)
+                        embed.add_field(name='⏰ Waktu Tersisa', value=countdown, inline=True)
+                        embed.add_field(name='🔔 Reminder Diatur', value=f'{format_date(reminder_local)} ({reminder_local.strftime("%H:%M")})', inline=True)
+                        embed.set_footer(text=f'ID: {str(edoc["_id"])[:8]} • Gunakan /doneevent untuk menyelesaikan')
+                        embed.timestamp = now_utc
+                        
+                        gs = await loop.run_in_executor(None, lambda: guilds_col.find_one({'guild_id': guild_id}))
+                        channel = None
+                        if gs and gs.get('channel_id_event'):
+                            channel = bot.get_channel(int(gs['channel_id_event']))
+                        
+                        if channel is None:
+                            g = bot.get_guild(guild_id)
+                            if g:
+                                channel = g.system_channel
+                                if channel is None:
+                                    for c in g.channels:
+                                        if isinstance(c, discord.TextChannel) and c.permissions_for(g.me).send_messages:
+                                            channel = c
+                                            break
+                        
+                        if channel:
+                            await channel.send(content=f'<@{user_id}>', embed=embed)
+                        
+                        custom_reminders[idx]['sent'] = True
+                        await loop.run_in_executor(None, lambda: events_col.update_one(
+                            {'_id': edoc['_id']},
+                            {'$set': {'custom_reminders': custom_reminders}}
+                        ))
+                        LOG.info('Sent custom reminder for event %s at %s', edoc['_id'], reminder_time)
+                    except Exception:
+                        LOG.exception('Failed to send custom reminder for event %s', edoc['_id'])
 
 
 async def send_weekly_summary():
@@ -1354,8 +1629,8 @@ async def send_weekly_summary():
             # Get guild settings for channel
             gs = await loop.run_in_executor(None, lambda: guilds_col.find_one({'guild_id': guild_id}))
             channel = None
-            if gs and gs.get('channel_id'):
-                channel = bot.get_channel(int(gs['channel_id']))
+            if gs and gs.get('channel_id_task'):
+                channel = bot.get_channel(int(gs['channel_id_task']))
             
             if channel is None:
                 g = bot.get_guild(guild_id)
@@ -1382,8 +1657,8 @@ async def send_weekly_summary():
             
             embed = discord.Embed(
                 title='📊 Rekap Mingguan Tugas',
-                description=f'**Periode:** {last_monday.strftime("%d %b")} - {last_saturday.strftime("%d %b %Y")}\n\n'
-                           f'Ringkasan tugas yang memiliki deadline minggu ini.',
+                description=f'**Tugas yang akan dikerjakan pada minggu {format_date(last_monday).split()[1]} - {format_date(last_saturday)}**\n\n'
+                           f'Daftar tugas dengan deadline selama minggu ini.',
                 color=discord.Color.blue()
             )
             
